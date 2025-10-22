@@ -1,22 +1,28 @@
-# -*- coding: utf-8 -*-
 """
-ADVANCED Telegram Broadcast Bot v3.0 (සිංහල Comments)
-- python-telegram-bot v20+ සඳහා සම්පූර්ණයෙන්ම යාවත්කාලීන කර ඇත
-- සියලුම කේතය එකම ගොනුවක.
+ADVANCED Telegram Broadcast Bot (English Version)
+- Fully updated for python-telegram-bot v20+
+- All code in a single file.
+- All scheduling features have been REMOVED for stability and simplicity.
 
---- NEW FEATURES v3.0 (අලුත් විශේෂාංග) ---
-1.  FIXED: Persistent Scheduling (ස්ථිර Schedule පද්ධතිය):
-    - Schedule jobs දැන් Bot ගේ මතකයේ (memory) වෙනුවට Firebase Database එකේ ගබඩා කෙරේ.
-    - Server එක restart වුවද, schedule jobs මැකී යන්නේ නැත.
-    - Bot එක සෑම මිනිත්තුවකම (60s) වරක් DB එක පරීක්ෂා කර නියමිත jobs ක්‍රියාත්මක කරයි.
-2.  FIXED: /remshed විධානය දැන් Database එකෙන් jobs ඉවත් කරයි.
+--- ADVANCED FEATURES ---
+1.  Multi-Line Buttons:
+    - Provide buttons and URLs in new lines after the command.
+    - Example:
+      /send
+      Button 1 | https://link1.com
+      Button 2 | https://link2.com
 
---- ADVANCED FEATURES (පැරණි දියුණු විශේෂාංග) ---
-1.  Button Confirmation (බොත්තම් මගින් තහවුරු කිරීම)
-2.  Multi-Line Buttons (බහු-පේළි බොත්තම්)
-3.  Smart Send (ස්වයංක්‍රීය Forward/Copy)
-4.  Broadcast Throttling (විකාශන වේගය පාලනය)
-5.  Updated /vip Menu & Startup Notification
+2.  Smart Send (Auto Forward/Copy):
+    - /send (without buttons) -> Forwards the message.
+    - /send (with buttons) -> Copies the message with buttons.
+
+3.  Button Confirmation:
+    - Admin must confirm every broadcast by clicking a "YES" or "NO" button.
+
+4.  Broadcast Throttling:
+    - Sends messages at a safe rate (25 msgs/sec) to avoid Telegram rate-limits.
+
+5.  Updated /vip Menu & Startup Notification.
 """
 
 import logging
@@ -24,7 +30,7 @@ import firebase_admin
 import asyncio
 import re
 from firebase_admin import credentials, firestore
-from datetime import datetime, timedelta, timezone # Timezone අලුතෙන් import කරන ලදී
+from datetime import datetime # Still needed for 'subscribed_at'
 from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden
@@ -37,125 +43,121 @@ from telegram.ext import (
     CallbackQueryHandler
 )
 
-# --- START OF CONFIGURATION (සැකසුම්) ---
+# --- START OF CONFIGURATION ---
 TELEGRAM_BOT_TOKEN = "8419617505:AAFwnP-m7fbhbcUYFKm85xQmz0FLsyupZbE"
 ADMIN_USER_ID = 6687619682
 TARGET_GROUP_ID = -1003074965096
 # --- END OF CONFIGURATION ---
 
-# --- ADVANCED CONFIG (උසස් සැකසුම්) ---
-BROADCAST_RATE_LIMIT = 25 # තත්පරයකට යවන පණිවිඩ ගණන
-SCHEDULE_CHECK_INTERVAL = 60 # Schedule jobs පරීක්ෂා කරන කාලය (තත්පර 60 = මිනිත්තුව 1)
+# --- ADVANCED CONFIG ---
+# Number of messages sent per second. 25 is a safe limit (Telegram's limit is ~30/sec)
+BROADCAST_RATE_LIMIT = 25 
 
-# ලොග් සැකසීම (Logging)
+# Setup logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Firebase ආරම්භ කිරීම (Initialize Firebase)
+# Initialize Firebase
 try:
     cred = credentials.Certificate("serviceAccountKey.json")
     firebase_admin.initialize_app(cred)
     db = firestore.client()
-    logger.info("Firebase සාර්ථකව සම්බන්ධ විය!")
+    logger.info("Successfully connected to Firebase!")
 except Exception as e:
-    logger.error(f"Firebase සම්බන්ධ වීමේ දෝෂයක්: {e}")
+    logger.error(f"Error connecting to Firebase: {e}")
+    # Exit if Firebase connection fails
     exit()
 
-# --- HELPER FUNCTIONS (උපකාරක ශ්‍රිත) ---
+# --- HELPER FUNCTIONS ---
 
 async def check_group_membership(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> dict:
-    """පරිශීලකයා group එකේ සාමාජිකයෙක්දැයි පරීක්ෂා කරයි."""
+    """Checks if a user is a member of the target group."""
     try:
         member = await context.bot.get_chat_member(chat_id=TARGET_GROUP_ID, user_id=user_id)
         if member.status in ['member', 'administrator', 'creator', 'restricted']:
             return {"is_member": True, "status": member.status}
         else:
+            # 'left' or 'kicked'
             return {"is_member": False, "status": member.status}
     except (BadRequest, Forbidden) as e:
-        logger.error(f"සාමාජිකත්වය පරීක්ෂා කිරීමේ දෝෂයක් (ID: {user_id}): {e}")
+        logger.error(f"Error checking membership for {user_id}: {e}")
+        # This happens if the bot is not an admin in the group
         return {"is_member": False, "status": "error", "error_message": str(e)}
     except Exception as e:
-        logger.error(f"සාමාන්‍ය දෝෂයක් (සාමාජිකත්වය පරීක්ෂා කිරීම): {e}")
+        logger.error(f"Generic error in check_group_membership: {e}")
         return {"is_member": False, "status": "error", "error_message": str(e)}
 
 async def notify_admin_on_startup(app: Application) -> None:
-    """Bot එක ඔන් වූ විට Admin ට DM එකක් යවයි."""
+    """Sends a DM to the Admin when the bot starts."""
     try:
         await app.bot.send_message(
             chat_id=ADMIN_USER_ID,
-            text=f"🤖 *Bot is now ONLINE! (Advanced v3.0 - Persistent Schedule)*\n\n"
+            text=f"🤖 *Bot is now ONLINE! (English Version)*\n\n"
                  f"Throttling: *{BROADCAST_RATE_LIMIT} msg/sec*\n"
-                 f"Schedule Check: *Every {SCHEDULE_CHECK_INTERVAL} sec*\n"
+                 f"Features: Button Confirm, Multi-Button, No Schedule.\n"
                  f"Use /vip to see your admin commands.",
             parse_mode=ParseMode.MARKDOWN
         )
-        logger.info("Admin හට startup පණිවිඩය යවන ලදී.")
+        logger.info("Admin startup notification sent.")
     except Exception as e:
-        logger.error(f"Admin හට startup පණිවිඩය යැවීමට නොහැකි විය: {e}")
+        logger.error(f"Failed to send startup notification to Admin: {e}")
 
 def parse_buttons(message_text: str) -> (InlineKeyboardMarkup | None):
-    """බහු-පේළි බොත්තම් (multi-line buttons) සකසන ශ්‍රිතය."""
-    lines = message_text.split('\n')[1:] # පළමු පේළිය (command එක) මඟ හැරීම
+    """Parses the multi-line button format."""
+    lines = message_text.split('\n')[1:] # Skip the first line (the command)
     buttons = []
     if not lines:
-        return None # බොත්තම් නැත
+        return None # No buttons provided
 
     for line in lines:
         line = line.strip()
         if not line:
             continue
+            
         try:
+            # Split by '|'
             button_text, button_url = line.split('|', 1)
             button_text = button_text.strip()
             button_url = button_url.strip()
+            
+            # Basic URL validation
             if not (button_url.startswith("http://") or button_url.startswith("https://")):
-                logger.warning(f"වලංගු නොවන URL එකක් මඟ හරින ලදී: {button_url}")
+                logger.warning(f"Skipping invalid URL: {button_url}")
                 continue
+                
             buttons.append([InlineKeyboardButton(text=button_text, url=button_url)])
+        
         except ValueError:
-            logger.warning(f"වලංගු නොවන බොත්තම් ආකෘතියක් මඟ හරින ලදී: {line}")
+            logger.warning(f"Skipping invalid button format: {line}")
             continue
     
     if buttons:
         return InlineKeyboardMarkup(buttons)
     return None
 
-def parse_time(time_str: str) -> (int | None):
-    """Schedule command එකේ කාලය තත්පර වලට හරවයි (10m, 2h, 1d)."""
-    if not time_str:
-        return None
-    match = re.match(r"^(\d+)([mhd])$", time_str.lower())
-    if not match:
-        return None
-    value = int(match.group(1))
-    unit = match.group(2)
-    if unit == 'm':
-        return value * 60 # මිනිත්තු
-    elif unit == 'h':
-        return value * 3600 # පැය
-    elif unit == 'd':
-        return value * 86400 # දවස්
-    return None
-
 def get_subscriber_ids() -> list:
-    """Database එකෙන් සියලුම subscriber IDs ලබාගැනීම."""
+    """Gets all subscriber IDs from the database."""
     try:
         users_ref = db.collection('subscribers').stream()
         return [user.id for user in users_ref]
     except Exception as e:
-        logger.error(f"Firestore වෙතින් subscriber IDs ලබාගත නොහැකි විය: {e}")
+        logger.error(f"Could not get subscriber IDs from Firestore: {e}")
         return []
 
 
 async def do_broadcast(context: ContextTypes.DEFAULT_TYPE, job_data: dict) -> None:
-    """Broadcast එක සිදුකරන ප්‍රධාන ශ්‍රිතය (Throttling සමග)."""
+    """
+    The main broadcast function (with throttling).
+    Called by `button_confirmation_handler`.
+    """
     
+    # Get data from the job
     admin_id = job_data["admin_id"]
     from_chat_id = job_data["from_chat_id"]
     message_id = job_data["message_id"]
-    # job_data['buttons'] යනු dict එකක් (Firestore නිසා). එය නැවත object එකක් කළ යුතුයි.
+    # 'buttons' is stored as a dict, needs to be converted back to an object
     buttons_dict = job_data.get("buttons")
     buttons_markup = InlineKeyboardMarkup.from_dict(buttons_dict) if buttons_dict else None
     
@@ -163,419 +165,286 @@ async def do_broadcast(context: ContextTypes.DEFAULT_TYPE, job_data: dict) -> No
     
     subscriber_ids = get_subscriber_ids()
     if not subscriber_ids:
-        await context.bot.send_message(admin_id, "Database එක හිස්ය. Broadcast එක අවලංගු කරන ලදී.")
+        await context.bot.send_message(admin_id, "Broadcast cancelled. The subscriber database is empty.")
         return
 
     total_users = len(subscriber_ids)
     success_count = 0
     failure_count = 0
     
-    # Admin ට broadcast එක පටන් ගත් බව දැනුම් දීම
-    # Schedule වූ job එකක් නම් "Broadcast එක ඇරඹුණා" යැවීම
-    if job_data.get("is_scheduled", False):
-         await context.bot.send_message(
-            admin_id,
-            f"⏳ *Schedule වූ broadcast එකක් අරඹමින්...*\n\n"
-            f"ක්‍රියාව: *{operation.upper()}*\n"
-            f"පරිශීලකයින් *{total_users}* දෙනෙකුට යවමින් සිටී (වේගය: {BROADCAST_RATE_LIMIT} msg/sec).\n\n"
-            f"මෙය අවසන් වූ පසු ඔබට අවසන් වාර්තාවක් ලැබෙනු ඇත.",
-            parse_mode=ParseMode.MARKDOWN
-        )
+    # Notify Admin that the broadcast has started
+    await context.bot.send_message(
+        admin_id,
+        f"🚀 *Broadcast Started...*\n\n"
+        f"Operation: *{operation.upper()}*\n"
+        f"Sending to *{total_users}* users (Rate: {BROADCAST_RATE_LIMIT} msg/sec).\n\n"
+        f"You will get a final report when this is complete.",
+        parse_mode=ParseMode.MARKDOWN
+    )
     
-    # Throttled Loop - වේගය පාලනය කරමින් යැවීම
+    # Throttled Loop
     for user_id_str in subscriber_ids:
         try:
             user_id_int = int(user_id_str)
+            
             if operation == "copy":
-                await context.bot.copy_message(chat_id=user_id_int, from_chat_id=from_chat_id, message_id=message_id, reply_markup=buttons_markup)
+                await context.bot.copy_message(
+                    chat_id=user_id_int,
+                    from_chat_id=from_chat_id,
+                    message_id=message_id,
+                    reply_markup=buttons_markup
+                )
             else: # operation == "forward"
-                await context.bot.forward_message(chat_id=user_id_int, from_chat_id=from_chat_id, message_id=message_id)
+                await context.bot.forward_message(
+                    chat_id=user_id_int,
+                    from_chat_id=from_chat_id,
+                    message_id=message_id
+                )
             success_count += 1
+            
         except (Forbidden, BadRequest) as e:
             failure_count += 1
+            logger.error(f"Failed to send to {user_id_str}: {e}")
+            # Auto-remove users who blocked the bot or are deactivated
             if "bot was blocked by the user" in str(e).lower() or "user is deactivated" in str(e).lower():
-                logger.info(f"User {user_id_str} විසින් bot ව block කර ඇත. Database එකෙන් ඉවත් කරමින්...")
+                logger.info(f"User {user_id_str} blocked the bot. Removing from database...")
                 try:
                     db.collection('subscribers').document(user_id_str).delete()
                 except Exception as del_e:
-                    logger.error(f"User {user_id_str} ව ඉවත් කිරීමට නොහැකි විය: {del_e}")
+                    logger.error(f"Failed to delete user {user_id_str}: {del_e}")
         except Exception as e:
             failure_count += 1
-            logger.error(f"{user_id_str} වෙත යැවීමේදී නොදන්නා දෝෂයක්: {e}")
+            logger.error(f"Unknown error sending to {user_id_str}: {e}")
 
-        # Throttling - වේගය පාලනය කිරීම
+        # The Throttling sleep
         await asyncio.sleep(1 / BROADCAST_RATE_LIMIT)
 
-    # Admin ට අවසන් වාර්තාව යැවීම
+    # Send final report to Admin
     await context.bot.send_message(
         admin_id,
-        f"✅ *Broadcast එක අවසන්!*\n\n"
-        f"සාර්ථකව යැවූ ගණන: *{success_count}*\n"
-        f"අසාර්ථක වූ ගණන: *{failure_count}*\n"
-        f"(Block කළ/Deactivated වූ පරිශීලකයින් ස්වයංක්‍රීයව ඉවත් කරන ලදී)",
+        f"✅ *Broadcast Complete!*\n\n"
+        f"Successfully Sent: *{success_count}*\n"
+        f"Failed to Send: *{failure_count}*\n"
+        f"(Blocked/Deactivated users have been auto-removed)",
         parse_mode=ParseMode.MARKDOWN
     )
 
-# --- BOT HANDLER FUNCTIONS (පරිශීලක විධාන) ---
+# --- BOT HANDLER FUNCTIONS ---
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/start විධානය සහ group සාමාජිකත්වය තහවුරු කිරීම."""
+    """Handles the /start command and checks group membership."""
     user = update.effective_user
     chat = update.effective_chat
     
+    # Ignore /start in group chats
     if chat.type != 'private':
         if str(chat.id) == str(TARGET_GROUP_ID):
             try:
-                await update.message.reply_text(f"👋 @{user.username or user.first_name}, කරුණාකර මට /start යන්න පුද්ගලිකව (DM) එවන්න!", reply_to_message_id=update.message.message_id)
+                await update.message.reply_text(
+                    f"👋 @{user.username or user.first_name}, please send me /start privately (in a DM)!",
+                    reply_to_message_id=update.message.message_id
+                )
             except Exception: pass
         return
 
-    logger.info(f"User {user.id} වෙතින් /start ලැබුණි (DM)")
+    logger.info(f"Received /start from User {user.id} (DM)")
+    
+    # Check if user is in the target group
     membership = await check_group_membership(context, user.id)
 
     if not membership["is_member"]:
-        logger.info(f"User {user.id} group එකේ නැත (Status: {membership['status']}). ලියාපදිංචිය ප්‍රතික්ෂේප විය.")
+        logger.info(f"User {user.id} is not in the group (Status: {membership['status']}). Subscription rejected.")
         reply_text = (
-            "⛔ *ලියාපදිංචිය අසාර්ථකයි*\n\n"
-            "Broadcast සේවාව ලබාගැනීමට, ඔබ අපගේ ප්‍රධාන group එකේ සාමාජිකයෙකු විය යුතුය.\n\n"
-            "කරුණාකර group එකට join වී, නැවත මෙහි /start ලෙස ටයිප් කරන්න."
+            "⛔ *Subscription Failed*\n\n"
+            "To use this bot and receive broadcasts, you must be a member of our main group.\n\n"
+            "Please join the group and then type /start here again."
         )
+        
         if membership["status"] == "error":
-            reply_text = "⚠️ ඔබගේ සාමාජිකත්වය තහවුරු කිරීමේදී දෝෂයක් සිදුවිය. කරුණාකර පසුව නැවත උත්සාහ කරන්න."
+            # This means the bot is not an admin in the group
+            reply_text = "⚠️ A system error occurred while checking your membership. Please try again later."
+            # Notify Admin of the critical error
             await context.bot.send_message(
                 chat_id=ADMIN_USER_ID,
-                text=f"🆘 *CRITICAL BOT ERROR*\n\nUser `{user.id}` ගේ සාමාජිකත්වය (group: `{TARGET_GROUP_ID}`) පරීක්ෂා කළ නොහැක.\n\n*දෝෂය:* `{membership.get('error_message')}`\n\n👉 **ක්‍රියාමාර්ගය: Bot ව අනිවාර්යයෙන්ම group එකේ ADMINISTRATOR කෙනෙක් කරන්න!**",
+                text=f"🆘 *CRITICAL BOT ERROR*\n\n"
+                     f"Cannot check membership for User `{user.id}` (Group: `{TARGET_GROUP_ID}`).\n\n"
+                     f"*Error:* `{membership.get('error_message')}`\n\n"
+                     "👉 **ACTION REQUIRED: You MUST make the bot an ADMINISTRATOR in your group!**",
                 parse_mode=ParseMode.MARKDOWN
             )
+            
         await update.message.reply_text(reply_text, parse_mode=ParseMode.MARKDOWN)
         return
 
+    # --- User is a member, add to DB ---
     try:
-        logger.info(f"User {user.id} group එකේ සිටී. (Status: {membership['status']}).")
+        logger.info(f"User {user.id} is in the group (Status: {membership['status']}).")
+        
         user_doc_ref = db.collection('subscribers').document(str(user.id))
         user_doc = user_doc_ref.get()
-        if not user_doc.exists:
-            user_data = {'user_id': user.id, 'first_name': user.first_name, 'last_name': user.last_name or '', 'username': user.username or '', 'subscribed_at': firestore.SERVER_TIMESTAMP}
-            user_doc_ref.set(user_data)
-            logger.info(f"නව පරිශීලකයෙක් ({user.id}) Firestore වෙත ඇතුලත් කරන ලදී.")
-            await context.bot.send_message(chat_id=user.id, text="✅ *සාර්ථකව ලියාපදිංචි විය!*\n\nඔබව අපගේ broadcast ලැයිස්තුවට සාර්ථකව ඇතුලත් කරගන්නා ලදී.", parse_mode=ParseMode.MARKDOWN)
-        else:
-            logger.info(f"User {user.id} දැනටමත් ලියාපදිංචි වී ඇත.")
-            await context.bot.send_message(chat_id=user.id, text="ℹ️ ඔබ දැනටමත් අපගේ broadcast ලැයිස්තුවේ ලියාපදිංචි වී ඇත.")
-    except Exception as e:
-        logger.error(f"/start විධානයේ දෝෂයක් (User {user.id}): {e}")
-        await update.message.reply_text("⚠️ පද්ධතියේ දෝෂයක් සිදුවිය. කරුණාකර පසුව නැවත උත්සාහ කරන්න.")
 
-# --- ADMIN COMMANDS (Admin ගේ විධාන) ---
+        if not user_doc.exists:
+            # Add new user to DB
+            user_data = {
+                'user_id': user.id,
+                'first_name': user.first_name,
+                'last_name': user.last_name or '',
+                'username': user.username or '',
+                'subscribed_at': firestore.SERVER_TIMESTAMP
+            }
+            user_doc_ref.set(user_data)
+            logger.info(f"New subscriber {user.id} added to Firestore.")
+            
+            await context.bot.send_message(
+                chat_id=user.id,
+                text="✅ *Subscription Successful!*\n\n"
+                     "You have been successfully added to our broadcast list. "
+                     "You will now receive all important updates directly.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            # User is already in DB
+            logger.info(f"User {user.id} is already subscribed.")
+            await context.bot.send_message(
+                chat_id=user.id,
+                text="ℹ️ You are already subscribed to our broadcast list."
+            )
+
+    except Exception as e:
+        logger.error(f"Error in /start handler for User {user.id}: {e}")
+        await update.message.reply_text("⚠️ A system error occurred. Please try again later.")
+
+# --- ADMIN COMMANDS ---
 
 async def vip_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """v3.0 - යාවත්කාලීන කරන ලද /vip මෙනුව පෙන්වයි."""
+    """Displays the updated Admin VIP Menu."""
     menu_text = (
-        "👑 *Admin VIP Menu (Advanced v3.0)*\n\n"
+        "👑 *Admin VIP Menu (English Version)*\n\n"
         
         "*/vip*\n"
-        "› මෙම මෙනුව පෙන්වයි.\n\n"
+        "› Shows this help menu.\n\n"
         
         "*/send*\n"
-        "› පණිවිඩයකට reply කර මෙය යොදන්න. Bot විසින් බොත්තම් මගින් තහවුරු කිරීමට අසනු ඇත.\n"
-        "› **බොත්තම් නැතුව:** පණිවිඩය FORWARD කරයි.\n"
-        "› **බොත්තම් සමග:** පණිවිඩය COPY කරයි.\n\n"
+        "› Reply to a message and use this command. The bot will ask for confirmation.\n"
+        "› **Without Buttons:** FORWARDS the message.\n"
+        "› **With Buttons:** COPIES the message.\n\n"
 
-        "*/schedule* `[කාලය]`\n"
-        "› `/send` මෙනි, නමුත් නියමිත වේලාවකට schedule කරයි.\n"
-        "› `[කාලය]` = 10m, 2h, 1d.\n\n"
-
-        "*බොත්තම් යොදන ආකාරය (/send & /schedule සඳහා):*\n"
-        "විධානයට පසුව, *නව පේළි වලින්* බොත්තම් යොදන්න.\n"
-
-        "*/stats*\n"
-        "› මුළු subscribers ලා ගණන පෙන්වයි.\n\n"
+        "*How to Add Buttons (for /send):*\n"
+        "Type the command, then add buttons on *new lines*.\n"
         
-        "*/remshed*\n"
-        "› (FIXED!) Schedule කර ඇති *සියලුම* broadcasts (Database එකෙන්) අවලංගු කරයි.\n\n"
+        "*/stats*\n"
+        "› Shows the total number of subscribers.\n\n"
         
         "*/getuser* `[USER_ID]`\n"
-        "› subscriber කෙනෙකුගේ විස්තර පෙන්වයි.\n\n"
+        "› Shows details for a specific subscriber.\n\n"
         
         "*/deluser* `[USER_ID]`\n"
-        "› subscriber කෙනෙක්ව database එකෙන් ඉවත් කරයි."
+        "› Deletes a subscriber from the database."
     )
     await update.message.reply_text(menu_text, parse_mode=ParseMode.MARKDOWN)
 
 async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/send විධානය. තහවුරු කිරීමට බොත්තම් (Buttons) ඉල්ලයි."""
+    """Handles the /send command. Asks for button confirmation."""
     
     if not update.message.reply_to_message:
-        await update.message.reply_text("⚠️ *භාවිතා කරන ආකාරය:*\nඔබට යැවීමට අවශ්‍ය පණිවිඩයට Reply කර `/send` ලෙස ටයිප් කරන්න.")
+        await update.message.reply_text("⚠️ *Usage Error:*\nReply to the message you want to send and type `/send`.")
         return
         
-    context.chat_data.clear() # පැරණි තහවුරු කිරීම් ඉවත් කිරීම
+    context.chat_data.clear() # Clear any old pending confirmations
+    
     message_to_send = update.message.reply_to_message
-    buttons = parse_buttons(update.message.text)
+    buttons = parse_buttons(update.message.text) # Check for multi-line buttons
     subscriber_count = len(get_subscriber_ids())
-    operation = "COPY with buttons" if buttons else "FORWARD"
+    operation = "COPY with buttons" if buttons else "FORWARD" # Smart Send
 
-    # දත්ත තාවකාලිකව මතකයේ තබාගැනීම
+    # Store data temporarily while waiting for confirmation
     context.chat_data['pending_broadcast'] = {
         "admin_id": update.effective_user.id,
         "from_chat_id": message_to_send.chat_id,
         "message_id": message_to_send.message_id,
-        # InlineKeyboardMarkup object එක Firestore එකට යැවීමට dict එකක් බවට පත්කළ යුතුයි
+        # Convert InlineKeyboardMarkup to a dict for storage
         "buttons": buttons.to_dict() if buttons else None,
         "count": subscriber_count,
         "operation": operation
     }
 
-    # Admin ගෙන් තහවුරු කිරීම ඉල්ලීම (බොත්තම් සමග)
+    # Ask Admin for confirmation (with buttons)
     keyboard = [
-        [InlineKeyboardButton("✅ YES (තහවුරු කරන්න)", callback_data="confirm_broadcast_yes")],
-        [InlineKeyboardButton("❌ NO (අවලංගු කරන්න)", callback_data="confirm_broadcast_no")]
+        [InlineKeyboardButton("✅ YES (Confirm)", callback_data="confirm_broadcast_yes")],
+        [InlineKeyboardButton("❌ NO (Cancel)", callback_data="confirm_broadcast_no")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     await update.message.reply_text(
-        f"⚠️ *Broadcast එක තහවුරු කරන්න*\n\n"
-        f"ඔබ මෙම පණිවිඩය *{operation.upper()}* කිරීමට සූදානම්.\n"
-        f"මුළු පරිශීලකයින් ගණන: *{subscriber_count}*\n\n"
-        f"කරුණාකර පහත බොත්තමක් මගින් තහවුරු කරන්න:",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=reply_markup
-    )
-
-async def schedule_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/schedule විධානය. v3.0 - තහවුරු කිරීමට බොත්තම් (Buttons) ඉල්ලයි."""
-
-    if not update.message.reply_to_message:
-        await update.message.reply_text("⚠️ *භාවිතා කරන ආකාරය:*\nපණිවිඩයකට Reply කර `/schedule [කාලය]` ලෙස යොදන්න (උදා: `/schedule 2h`).")
-        return
-    if not context.args:
-        await update.message.reply_text("⚠️ *කාලය අවශ්‍යයි.*\nභාවිතය: `/schedule 10m` හෝ `/schedule 2h` හෝ `/schedule 1d`")
-        return
-
-    context.chat_data.clear() # පැරණි තහවුරු කිරීම් ඉවත් කිරීම
-    time_str = context.args[0]
-    time_in_seconds = parse_time(time_str)
-    
-    if time_in_seconds is None:
-        await update.message.reply_text("⚠️ *කාල ආකෘතිය වැරදියි.*\n`m` (මිනිත්තු), `h` (පැය), හෝ `d` (දවස්) භාවිතා කරන්න.\nඋදාහරණ: `/schedule 2h`")
-        return
-
-    message_to_send = update.message.reply_to_message
-    buttons = parse_buttons(update.message.text)
-    subscriber_count = len(get_subscriber_ids())
-    operation = "COPY with buttons" if buttons else "FORWARD"
-
-    # දත්ත තාවකාලිකව මතකයේ තබාගැනීම
-    context.chat_data['pending_schedule'] = {
-        "admin_id": update.effective_user.id,
-        "from_chat_id": message_to_send.chat_id,
-        "message_id": message_to_send.message_id,
-        "buttons": buttons.to_dict() if buttons else None,
-        "count": subscriber_count,
-        "operation": operation,
-        "time_str": time_str,
-        "time_sec": time_in_seconds
-    }
-
-    # Admin ගෙන් තහවුරු කිරීම ඉල්ලීම (බොත්තම් සමග)
-    keyboard = [
-        [InlineKeyboardButton("✅ YES (Schedule කරන්න)", callback_data="confirm_schedule_yes")],
-        [InlineKeyboardButton("❌ NO (අවලංගු කරන්න)", callback_data="confirm_schedule_no")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await update.message.reply_text(
-        f"⏳ *Schedule එක තහවුරු කරන්න*\n\n"
-        f"ඔබ මෙම පණිවිඩය *{operation.upper()}* කිරීමට සූදානම්.\n"
-        f"මුළු පරිශීලකයින් ගණන: *{subscriber_count}*\n"
-        f"යවන කාලය: තව *{time_str}* කින්.\n\n"
-        f"කරුණාකර පහත බොත්තමක් මගින් තහවුරු කරන්න:",
+        f"⚠️ *Confirm Broadcast*\n\n"
+        f"You are about to *{operation.upper()}* this message.\n"
+        f"Total Subscribers: *{subscriber_count}*\n\n"
+        f"Please confirm or cancel using the buttons below:",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=reply_markup
     )
 
 async def button_confirmation_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """v3.0 - 'YES'/'NO' බොත්තම් click කිරීම් හසුරුවයි."""
+    """Handles the 'YES'/'NO' button clicks for confirmation."""
     
     query = update.callback_query
-    await query.answer() # බොත්තම click කළ බව Telegram වෙත දැනුම් දීම
+    await query.answer() # Acknowledge the button click
     
-    data = query.data # "confirm_broadcast_yes" වැනි දත්ත
+    data = query.data # "confirm_broadcast_yes" or "confirm_broadcast_no"
     
-    # --- Broadcast තහවුරු කිරීම ---
+    # --- Broadcast Confirmation ---
     if data == "confirm_broadcast_yes":
         job_data = context.chat_data.pop('pending_broadcast', None)
         if job_data is None:
-            await query.edit_message_text("⚠️ මෙම ක්‍රියාව කල් ඉකුත් වී ඇත (Action Expired) හෝ දැනටමත් තහවුරු කර ඇත.", reply_markup=None)
+            await query.edit_message_text("⚠️ This action has expired or was already confirmed.", reply_markup=None)
             return
         
-        await query.edit_message_text("✅ තහවුරු කරන ලදී. Broadcast එක අරඹමින්...", reply_markup=None)
+        await query.edit_message_text("✅ Confirmed. Starting broadcast...", reply_markup=None)
+        # Start the broadcast as a background task
         context.application.create_task(do_broadcast(context, job_data))
         
     elif data == "confirm_broadcast_no":
         context.chat_data.pop('pending_broadcast', None)
-        await query.edit_message_text("❌ Broadcast එක අවලංගු කරන ලදී.", reply_markup=None)
-
-    # --- Schedule තහවුරු කිරීම (FIXED v3.0) ---
-    elif data == "confirm_schedule_yes":
-        job_data = context.chat_data.pop('pending_schedule', None)
-        if job_data is None:
-            await query.edit_message_text("⚠️ මෙම ක්‍රියාව කල් ඉකුත් වී ඇත (Action Expired) හෝ දැනටමත් තහවුරු කර ඇත.", reply_markup=None)
-            return
-
-        time_sec = job_data.pop('time_sec')
-        time_str = job_data.pop('time_str')
-        
-        # නියමිත වේලාව ගණනය කිරීම (UTC වේලාවෙන්)
-        run_at_time = datetime.now(timezone.utc) + timedelta(seconds=time_sec)
-        
-        # Job එක JobQueue එකට දානවා වෙනුවට, Firestore එකට ලිවීම
-        try:
-            # Job එකට අමතර දත්ත එකතු කිරීම
-            job_data["run_at"] = run_at_time
-            job_data["is_scheduled"] = True
-            job_data["created_at"] = firestore.SERVER_TIMESTAMP
-            
-            # Firestore 'scheduled_jobs' collection එකට ලිවීම
-            doc_ref = db.collection('scheduled_jobs').document()
-            doc_ref.set(job_data)
-            
-            logger.info(f"නව schedule job එකක් Firestore වෙත ලියන ලදී (ID: {doc_ref.id}) - {time_str} කින් ක්‍රියාත්මක වේ.")
-            
-            await query.edit_message_text(
-                f"✅ *සාර්ථකව Schedule කරන ලදී!*\n\n"
-                f"Broadcast එක තව *{time_str}* කින් යවනු ලැබේ.\n"
-                f"(Job ID: `{doc_ref.id}`)",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=None
-            )
-        except Exception as e:
-            logger.error(f"Firestore වෙත schedule job ලිවීමේ දෝෂයක්: {e}")
-            await query.edit_message_text(f"⚠️ Schedule කිරීමේදී දෝෂයක් සිදුවිය: {e}", reply_markup=None)
-            
-    elif data == "confirm_schedule_no":
-        context.chat_data.pop('pending_schedule', None)
-        await query.edit_message_text("❌ Schedule එක අවලංගු කරන ලදී.", reply_markup=None)
-
-# --- NEW v3.0: Persistent Job Checker ---
-async def check_scheduled_jobs(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    සෑම මිනිත්තුවකට වරක්ම (SCHEDULE_CHECK_INTERVAL) ක්‍රියාත්මක වේ.
-    Firestore එක පරීක්ෂා කර, නියමිත වේලාව පැමිණි jobs ක්‍රියාත්මක කරයි.
-    """
-    logger.info("[Scheduler] නියමිත jobs පරීක්ෂා කරමින්...")
-    
-    try:
-        # වේලාව පැමිණි (run_at <= now) සියලුම jobs Firestore වෙතින් ලබාගැනීම
-        now_utc = datetime.now(timezone.utc)
-        jobs_query = db.collection('scheduled_jobs').where('run_at', '<=', now_utc).limit(5) # එකවර 5ක් ගනිමු
-        
-        jobs_to_run = list(jobs_query.stream()) # Query එක ක්‍රියාත්මක කිරීම
-        
-        if not jobs_to_run:
-            logger.info("[Scheduler] ක්‍රියාත්මක කිරීමට jobs කිසිවක් නැත.")
-            return
-            
-        logger.info(f"[Scheduler] ක්‍රියාත්මක කිරීමට jobs {len(jobs_to_run)} ක් සොයාගන්නා ලදී.")
-
-        for job_doc in jobs_to_run:
-            job_data = job_doc.to_dict()
-            job_id = job_doc.id
-            
-            logger.info(f"[Scheduler] Job {job_id} ක්‍රියාත්මක කරමින්...")
-            
-            # 1. Job එක Database එකෙන් ඉවත් කිරීම (දෙපාරක් run වීම වැළැක්වීමට)
-            try:
-                db.collection('scheduled_jobs').document(job_id).delete()
-            except Exception as del_e:
-                logger.error(f"[Scheduler] Job {job_id} ඉවත් කිරීමේ දෝෂයක්: {del_e}. Broadcast එක මඟ හරිමින්.")
-                continue # මෙම job එක මඟ හැර ඊළඟ එකට යමු
-            
-            # 2. Broadcast එක අරඹීම (Background task එකක් ලෙස)
-            context.application.create_task(do_broadcast(context, job_data))
-            
-            logger.info(f"[Scheduler] Job {job_id} සාර්ථකව අරඹන ලදී.")
-            
-    except Exception as e:
-        logger.error(f"[Scheduler] Jobs පරීක්ෂා කිරීමේදී දරුණු දෝෂයක්: {e}")
+        await query.edit_message_text("❌ Broadcast Canceled.", reply_markup=None)
 
 
-# --- Other Admin Commands (අනෙකුත් Admin විධාන) ---
+# --- Other Admin Commands ---
 
 async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/stats - ගණනය කිරීම්."""
+    """/stats - Shows subscriber count."""
     try:
-        sub_count = len(get_subscriber_ids())
-        
-        # Firestore වෙතින් schedule වූ jobs ගණනද ගණනය කිරීම
-        sched_jobs = db.collection('scheduled_jobs').stream()
-        sched_count = len(list(sched_jobs))
-        
-        await update.message.reply_text(
-            f"📊 *Bot Statistics*\n\n"
-            f"මුළු Subscribers ලා ගණන: *{sub_count}*\n"
-            f"Schedule වී ඇති Jobs ගණන: *{sched_count}*",
-            parse_mode=ParseMode.MARKDOWN
-        )
+        count = len(get_subscriber_ids())
+        await update.message.reply_text(f"📊 *Bot Statistics*\nTotal Subscribers: *{count}*", parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
-        await update.message.reply_text(f"Stats ලබාගැනීමේ දෝෂයක්: {e}")
-
-async def cancel_schedule_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """FIXED v3.0 - /remshed - Firestore එකෙන් සියලුම schedule වූ job අවලංගු කිරීම."""
-    
-    logger.info("Admin විසින් /remshed විධානය ක්‍රියාත්මක කරන ලදී...")
-    try:
-        jobs_ref = db.collection('scheduled_jobs')
-        jobs_to_delete = list(jobs_ref.stream())
-        count = len(jobs_to_delete)
-        
-        if count == 0:
-            await update.message.reply_text("ℹ️ අවලංගු කිරීමට කිසිදු schedule job එකක් (Database එකේ) නොමැත.")
-            return
-
-        # Firestore 'batch delete' සඳහා සූදානම් වීම (වේගවත් ක්‍රමයක්)
-        batch = db.batch()
-        for job_doc in jobs_to_delete:
-            batch.delete(job_doc.reference)
-        
-        # Batch එක commit කිරීම (සියල්ල එකවර delete කිරීම)
-        batch.commit()
-        
-        logger.info(f"Admin විසින් schedule jobs {count} ක් අවලංගු කරන ලදී.")
-        await update.message.reply_text(f"✅ සාර්ථකයි! Schedule කර තිබූ broadcast jobs *{count}* ක් Database එකෙන් අවලංගු කරන ලදී.")
-        
-    except Exception as e:
-        logger.error(f"/remshed විධානයේ දෝෂයක්: {e}")
-        await update.message.reply_text(f"⚠️ Jobs අවලංගු කිරීමේදී දෝෂයක් සිදුවිය: {e}")
-
+        await update.message.reply_text(f"Error getting stats: {e}")
 
 async def delete_user_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/deluser - User කෙනෙක්ව ඉවත් කිරීම."""
+    """/deluser - Removes a user from the database."""
     if not context.args:
-        await update.message.reply_text("භාවිතය: `/deluser [USER_ID]`")
+        await update.message.reply_text("Usage: `/deluser [USER_ID]`")
         return
     user_id_to_delete = context.args[0]
     if not user_id_to_delete.isdigit():
-        await update.message.reply_text("වලංගු නොවන User ID එකකි. ඉලක්කම් පමණක් යොදන්න.")
+        await update.message.reply_text("Invalid User ID. Please provide numbers only.")
         return
     try:
         doc_ref = db.collection('subscribers').document(user_id_to_delete)
         if doc_ref.get().exists:
             doc_ref.delete()
-            await update.message.reply_text(f"✅ User {user_id_to_delete} ව database එකෙන් සාර්ථකව ඉවත් කරන ලදී.")
+            await update.message.reply_text(f"✅ User {user_id_to_delete} has been successfully deleted from the database.")
         else:
-            await update.message.reply_text(f"⚠️ User {user_id_to_delete} ව database එකේ සොයාගත නොහැක.")
+            await update.message.reply_text(f"⚠️ User {user_id_to_delete} was not found in the database.")
     except Exception as e:
-        await update.message.reply_text(f"User ව ඉවත් කිරීමේ දෝෂයක්: {e}")
+        await update.message.reply_text(f"Error deleting user: {e}")
 
 async def get_user_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/getuser - User කෙනෙකුගේ විස්තර බැලීම."""
+    """/getuser - Shows details for a specific user."""
     if not context.args:
-        await update.message.reply_text("භාවිතය: `/getuser [USER_ID]`")
+        await update.message.reply_text("Usage: `/getuser [USER_ID]`")
         return
     user_id_to_get = context.args[0]
     if not user_id_to_get.isdigit():
-        await update.message.reply_text("වලංගු නොවන User ID එකකි. ඉලක්කම් පමණක් යොදන්න.")
+        await update.message.reply_text("Invalid User ID. Please provide numbers only.")
         return
     try:
         doc = db.collection('subscribers').document(user_id_to_get).get()
@@ -584,63 +453,56 @@ async def get_user_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             sub_time_utc = data.get('subscribed_at')
             sub_time_str = "N/A"
             if sub_time_utc and isinstance(sub_time_utc, datetime):
-                # UTC වේලාව, +05:30 (ශ්‍රී ලංකා වේලාව) බවට පරිවර්තනය කිරීම (උදාහරණයක්)
-                # ඔබට අවශ්‍ය නම් මෙය `sub_time_utc.strftime...` ලෙස තබාගත හැක
-                sri_lanka_tz = timezone(timedelta(hours=5, minutes=30))
-                sub_time_local = sub_time_utc.astimezone(sri_lanka_tz)
-                sub_time_str = sub_time_local.strftime("%Y-%m-%d %H:%M:%S (%Z)")
+                sub_time_str = sub_time_utc.strftime("%Y-%m-%d %H:%M:%S (UTC)")
             
             username = f"@{data.get('username')}" if data.get('username') else "N/A"
             reply_text = (
-                f"👤 *පරිශීලක විස්තර: `{data.get('user_id')}`*\n\n"
+                f"👤 *User Details: `{data.get('user_id')}`*\n\n"
                 f"First Name: *{data.get('first_name')}*\n"
                 f"Last Name: *{data.get('last_name') or 'N/A'}*\n"
                 f"Username: *{username}*\n"
-                f"Subscribed On (UTC): `{sub_time_utc.strftime('%Y-%m-%d %H:%M:%S %Z') if sub_time_utc else 'N/A'}`"
+                f"Subscribed On: `{sub_time_str}`"
             )
             await update.message.reply_text(reply_text, parse_mode=ParseMode.MARKDOWN)
         else:
-            await update.message.reply_text(f"⚠️ User {user_id_to_get} ව database එකේ සොයාගත නොහැක.")
+            await update.message.reply_text(f"⚠️ User {user_id_to_get} was not found in the database.")
     except Exception as e:
-        logger.error(f"/getuser දෝෂයක්: {e}")
-        await update.message.reply_text(f"User ගේ විස්තර ලබාගැනීමේ දෝෂයක්: {e}")
+        logger.error(f"Error in /getuser: {e}")
+        await update.message.reply_text(f"Error getting user details: {e}")
 
 
 def main() -> None:
-    """Bot එක පණගැන්වීම."""
+    """Starts the bot."""
     
     if not TELEGRAM_BOT_TOKEN:
-        logger.error("TELEGRAM_BOT_TOKEN එක සකසා නැත! කරුණාකර configuration එක පරීක්ෂා කරන්න.")
+        logger.error("TELEGRAM_BOT_TOKEN is not set! Please check your configuration.")
         return
 
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    application.post_init = notify_admin_on_startup
-    admin_filter = filters.User(user_id=ADMIN_USER_ID)
-
-    # --- NEW v3.0: Persistent JobQueue Ticker ---
-    # Bot එක පණගැන්වූ විගස, 'check_scheduled_jobs' ශ්‍රිතය සෑම තත්පර 60කට වරක්ම
-    # (SCHEDULE_CHECK_INTERVAL) ක්‍රියාත්මක වීමට සලස්වයි.
-    job_queue = application.job_queue
-    job_queue.run_repeating(check_scheduled_jobs, interval=SCHEDULE_CHECK_INTERVAL, first=10)
-    # 'first=10' යනු: Bot එක on වී තත්පර 10කින් පළමු පරීක්ෂාව කිරීමයි.
     
-    # --- Handlers v3.0 (විධාන භාරගැනීම) ---
+    # Run notify_admin_on_startup after the bot is initialized
+    application.post_init = notify_admin_on_startup
+
+    # Filter for Admin-only commands
+    admin_filter = filters.User(user_id=ADMIN_USER_ID)
+    
+    # --- Handlers ---
+    # Public command
     application.add_handler(CommandHandler("start", start_command, filters=filters.ChatType.PRIVATE))
+    
+    # Admin commands
     application.add_handler(CommandHandler("vip", vip_menu_handler, filters=admin_filter))
     application.add_handler(CommandHandler("send", send_command, filters=admin_filter))
-    application.add_handler(CommandHandler("schedule", schedule_command, filters=admin_filter))
     application.add_handler(CommandHandler("stats", stats_handler, filters=admin_filter))
-    application.add_handler(CommandHandler("remshed", cancel_schedule_handler, filters=admin_filter))
     application.add_handler(CommandHandler("deluser", delete_user_handler, filters=admin_filter))
     application.add_handler(CommandHandler("getuser", get_user_handler, filters=admin_filter))
     
-    # 'YES'/'NO' බොත්තම් සඳහා CallbackQueryHandler
+    # Confirmation Button Handler
     application.add_handler(CallbackQueryHandler(button_confirmation_handler, pattern="^confirm_"))
 
-    logger.info(f"Bot (Advanced v3.0 - Persistent) සාර්ථකව ආරම්භ විය... polling කරමින්... Schedule check interval: {SCHEDULE_CHECK_INTERVAL}s")
+    logger.info("Bot (English Version) started successfully... polling...")
     application.run_polling()
 
 if __name__ == '__main__':
     main()
-
 
