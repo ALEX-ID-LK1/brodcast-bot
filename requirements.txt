@@ -1,1 +1,2 @@
-python-telegram-botfirebase-admin
+python-telegram-bot
+firebase-admin
