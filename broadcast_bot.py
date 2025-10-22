@@ -2,9 +2,8 @@
 """
 Telegram Broadcast Bot (English Version)
 - FULLY UPDATED for python-telegram-bot v20+
-- Fixes all ImportError issues (ParseMode, Filters)
-- Uses new Application builder pattern (replaces Updater)
-- Uses async/await for handlers
+- NEW: Handles /start in Private Chat (DM)
+- NEW: Checks if the user is a member of the TARGET_GROUP_ID before subscribing.
 """
 
 import logging
@@ -12,11 +11,12 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 from telegram import Update, Bot
 from telegram.constants import ParseMode
+from telegram.error import BadRequest, Forbidden
 from telegram.ext import (
     Application,
     CommandHandler,
     ContextTypes,
-    filters  # <-- FIX: Replaced 'Filters' with 'filters' (lowercase)
+    filters
 )
 
 # --- START OF CONFIGURATION ---
@@ -27,7 +27,7 @@ TELEGRAM_BOT_TOKEN = "8419617505:AAFwnP-m7fbhbcUYFKm85xQmz0FLsyupZbE"
 # 2. Admin User ID (Your Telegram User ID)
 ADMIN_USER_ID = 6687619682
 
-# 3. Target Group ID (The group ID to monitor for /start commands)
+# 3. Target Group ID (The group to check for membership)
 TARGET_GROUP_ID = -1003074965096
 
 # --- END OF CONFIGURATION ---
@@ -48,74 +48,104 @@ except Exception as e:
     logger.error(f"Failed to initialize Firebase: {e}")
     exit()
 
-# --- BOT HANDLER FUNCTIONS (NOW ASYNC) ---
+# --- BOT HANDLER FUNCTIONS (ASYNC) ---
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles the /start command."""
+    """
+    Handles the /start command.
+    Checks if it's a Private Message, then verifies group membership.
+    """
     user = update.effective_user
     chat = update.effective_chat
     
-    logger.info(f"Received /start from user {user.id} in chat {chat.id}")
-
-    # Check if the /start command is from the TARGET_GROUP_ID
-    if str(chat.id) == str(TARGET_GROUP_ID):
-        try:
-            # Save user to Firestore
-            user_doc_ref = db.collection('subscribers').document(str(user.id))
-            user_doc = user_doc_ref.get()
-
-            if not user_doc.exists:
-                user_data = {
-                    'user_id': user.id,
-                    'first_name': user.first_name,
-                    'last_name': user.last_name or '',
-                    'username': user.username or '',
-                    'subscribed_at': firestore.SERVER_TIMESTAMP
-                }
-                user_doc_ref.set(user_data)
-                logger.info(f"New user {user.id} added to Firestore.")
-                
-                # Send a private confirmation message
-                await context.bot.send_message(
-                    chat_id=user.id,
-                    text="✅ *Subscribed Successfully!*\n\n"
-                         "You have been successfully subscribed to our broadcast list. "
-                         "You will now receive important updates directly to your inbox.",
-                    parse_mode=ParseMode.MARKDOWN
-                )
-            else:
-                logger.info(f"User {user.id} is already subscribed.")
-                # Optionally, send a "you are already subscribed" message
-                await context.bot.send_message(
-                    chat_id=user.id,
-                    text="ℹ️ You are already on the broadcast list."
-                )
-
-        except Exception as e:
-            logger.error(f"Error handling /start command for user {user.id}: {e}")
+    # We only want to handle /start from a private chat (DM)
+    if chat.type != 'private':
+        logger.info(f"Ignoring /start from non-private chat {chat.id}")
+        # Optionally, reply in the group to guide the user
+        if str(chat.id) == str(TARGET_GROUP_ID):
             try:
-                await context.bot.send_message(
-                    chat_id=user.id,
-                    text="⚠️ An error occurred while subscribing. Please try again later."
+                await update.message.reply_text(
+                    f"👋 @{user.username or user.first_name}, please send me /start in a private chat (DM) to subscribe!",
+                    reply_to_message_id=update.message.message_id
                 )
-            except Exception as e_inner:
-                logger.error(f"Failed to send error DM to user {user.id}: {e_inner}")
+            except Exception as e:
+                logger.warning(f"Failed to reply to /start in group: {e}")
+        return
 
-    else:
-        # If /start is in a private chat or another group
-        logger.info(f"Ignoring /start from user {user.id} in non-target chat {chat.id}")
-        if chat.type == 'private':
+    logger.info(f"Received /start in DM from user {user.id}")
+
+    # --- NEW LOGIC: Check if user is in the target group ---
+    try:
+        # This call requires the bot to be an ADMIN in the TARGET_GROUP_ID
+        member = await context.bot.get_chat_member(chat_id=TARGET_GROUP_ID, user_id=user.id)
+        
+        # User is considered "in the group" if they are member, admin, creator, or restricted (e.g., muted)
+        if member.status not in ['member', 'administrator', 'creator', 'restricted']:
+            logger.info(f"User {user.id} is NOT in the group (status: {member.status}). Subscription denied.")
             await update.message.reply_text(
-                f"👋 Hello! To subscribe, please go to our main group and type /start.\n\n"
-                f"(You must be a member of the group with ID: `{TARGET_GROUP_ID}`)",
+                "⛔ *Subscription Failed*\n\n"
+                "You must be an active member of our main group to subscribe to broadcasts.\n\n"
+                "Please join the group and then type /start here again.",
                 parse_mode=ParseMode.MARKDOWN
             )
+            return
+
+        # --- User is in the group, proceed with subscription ---
+        logger.info(f"User {user.id} is in the group (status: {member.status}). Proceeding with subscription.")
+        
+        user_doc_ref = db.collection('subscribers').document(str(user.id))
+        user_doc = user_doc_ref.get()
+
+        if not user_doc.exists:
+            user_data = {
+                'user_id': user.id,
+                'first_name': user.first_name,
+                'last_name': user.last_name or '',
+                'username': user.username or '',
+                'subscribed_at': firestore.SERVER_TIMESTAMP
+            }
+            user_doc_ref.set(user_data)
+            logger.info(f"New user {user.id} added to Firestore.")
+            
+            await context.bot.send_message(
+                chat_id=user.id,
+                text="✅ *Subscribed Successfully!*\n\n"
+                     "You have been successfully subscribed to our broadcast list. "
+                     "You will now receive important updates directly to your inbox.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            logger.info(f"User {user.id} is already subscribed.")
+            await context.bot.send_message(
+                chat_id=user.id,
+                text="ℹ️ You are already on the broadcast list."
+            )
+
+    except (BadRequest, Forbidden) as e:
+        logger.error(f"Error checking chat member status for {user.id} in group {TARGET_GROUP_ID}: {e}")
+        await update.message.reply_text(
+            "⚠️ An error occurred while verifying your membership. Please try again later.\n\n"
+            "(If this persists, please contact an admin.)"
+        )
+        # Notify the BOT ADMIN that permissions might be wrong
+        await context.bot.send_message(
+            chat_id=ADMIN_USER_ID,
+            text=f"🆘 *CRITICAL BOT ERROR*\n\n"
+                 f"Failed to check member status for user `{user.id}` in group `{TARGET_GROUP_ID}`.\n\n"
+                 f"*Error:* `{e}`\n\n"
+                 "👉 **ACTION REQUIRED: Make sure the bot is an ADMINISTRATOR in the target group!**",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    except Exception as e:
+        logger.error(f"General error in /start for user {user.id}: {e}")
+        await update.message.reply_text("⚠️ A system error occurred. Please try again.")
+
 
 async def broadcast_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handles the /send command to broadcast a message."""
     user = update.effective_user
 
-    # Admin check (already handled by filter, but good for safety)
+    # Admin check
     if user.id != ADMIN_USER_ID:
         logger.warning(f"Unauthorized /send attempt by user {user.id}")
         await update.message.reply_text("⛔ Sorry, you are not authorized to use this command.")
@@ -189,22 +219,21 @@ def main() -> None:
         logger.error("TELEGRAM_BOT_TOKEN is not set! Please check your configuration.")
         return
 
-    # --- FIX: New v20+ way to start the bot ---
-    # 1. Create the Application
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # 2. Add handlers
+    # Add handlers
+    # We only want /start to work in private chats
     application.add_handler(CommandHandler("start", start_command))
+    
+    # /send command only works for the Admin
     application.add_handler(CommandHandler(
         "send", 
         broadcast_handler, 
-        filters=filters.User(user_id=ADMIN_USER_ID)  # <-- FIX: Use new 'filters.User'
+        filters=filters.User(user_id=ADMIN_USER_ID)
     ))
 
-    # 3. Run the Bot
-    logger.info("Bot started successfully (v20+ method) and is polling...")
+    logger.info("Bot started successfully (DM check method) and is polling...")
     application.run_polling()
-    # No 'idle()' needed
 
 if __name__ == '__main__':
     main()
