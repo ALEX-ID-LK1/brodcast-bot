@@ -1,26 +1,27 @@
+import os
 import logging
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
 import firebase_admin
 from firebase_admin import credentials, firestore
-from telegram import Update, Bot
+from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.error import Forbidden, BadRequest
 
 # --- Configuration ---
-# Your details have been pre-filled from your request.
 TELEGRAM_BOT_TOKEN = "8419617505:AAFwnP-m7fbhbcUYFKm85xQmz0FLsyupZbE"
 ADMIN_USER_ID = 6687619682
 TARGET_GROUP_ID = -1003074965096
 
 # --- Firebase Setup ---
-# Place your 'serviceAccountKey.json' file in the same directory as this script.
 try:
     cred = credentials.Certificate("serviceAccountKey.json")
     firebase_admin.initialize_app(cred)
     db = firestore.client()
-    print("Successfully connected to Firebase.")
+    print("✅ Successfully connected to Firebase.")
 except Exception as e:
-    print(f"Error connecting to Firebase: {e}")
-    print("Please make sure 'serviceAccountKey.json' is correct and in the same folder.")
+    print(f"❌ Error connecting to Firebase: {e}")
     exit()
 
 # --- Logging Setup ---
@@ -29,12 +30,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- Core Functions ---
+# --- Web Server (for Koyeb) ---
+class SimpleHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running successfully on Koyeb!")
+        
+def start_web_server():
+    port = int(os.getenv("PORT", 8080))  # Koyeb sets this automatically
+    server = HTTPServer(("0.0.0.0", port), SimpleHandler)
+    print(f"🌐 Web server listening on port {port}")
+    server.serve_forever()
 
+# --- Core Functions ---
 async def save_user_to_db(user):
-    """
-    Saves a user's ID and name to the Firebase Firestore database.
-    """
     try:
         user_ref = db.collection('users').document(str(user.id))
         user_data = {
@@ -43,68 +53,110 @@ async def save_user_to_db(user):
             'first_name': user.first_name,
             'last_active': firestore.SERVER_TIMESTAMP
         }
-        # Using set() with merge=True will create or update the user's data
         user_ref.set(user_data, merge=True)
-        logger.info(f"User {user.id} ({user.username}) was added/updated in the database.")
+        logger.info(f"User {user.id} ({user.username}) saved/updated in DB.")
         return True
     except Exception as e:
         logger.error(f"Error saving user {user.id}: {e}")
         return False
 
-# --- Command Handlers ---
 
+# --- Command Handlers ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Handles the /start command. Saves the user if in a private chat.
-    """
     user = update.effective_user
     if update.message.chat.type == 'private':
-        # User started the bot in a private message (DM)
         saved = await save_user_to_db(user)
         if saved:
             await update.message.reply_text(
-                f"Hello {user.first_name}!\n\n"
-                "You have been successfully registered for broadcast messages. "
-                "You will now receive important updates from the admin."
+                f"Hello {user.first_name}!\n\nYou have been successfully registered for updates."
             )
         else:
-            await update.message.reply_text("An error occurred during registration. Please try again later.")
+            await update.message.reply_text("An error occurred during registration.")
     else:
-        # User typed /start in a group
-        # We try to DM the user to ask them to start the bot privately
         try:
             await context.bot.send_message(
                 chat_id=user.id,
-                text=f"Hello {user.first_name}! To subscribe to broadcast messages, "
-                     "please send me the /start command privately (in our DM chat)."
+                text=f"Hello {user.first_name}! Please send /start to me privately to register."
             )
         except Forbidden:
-            logger.warning(f"Cannot send DM to {user.id} (Bot is blocked).")
+            logger.warning(f"Cannot DM {user.id} (bot blocked).")
         except BadRequest:
-             logger.warning(f"Cannot find chat with {user.id} (User hasn't started the bot).")
+            logger.warning(f"Cannot find chat with {user.id}.")
 
 
 async def new_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Handles new members joining the target group.
-    """
-    # Check if the message is from the correct group
     if update.message.chat_id != TARGET_GROUP_ID:
         return
 
-    new_members = update.message.new_chat_members
-    for user in new_members:
+    for user in update.message.new_chat_members:
         if not user.is_bot:
-            logger.info(f"New member in target group {TARGET_GROUP_ID}: {user.id}")
-            # Try to save the user to the DB (they won't be subscribed yet)
+            logger.info(f"New member {user.id}")
             await save_user_to_db(user)
-            
-            # Send a DM to the new member asking them to /start the bot
             try:
                 await context.bot.send_message(
                     chat_id=user.id,
-                    text=f"Welcome {user.first_name} to the {update.message.chat.title} group!\n\n"
-                         "To receive important updates and broadcasts, "
+                    text=f"Welcome {user.first_name}! Send /start here to subscribe for updates."
+                )
+            except Exception as e:
+                logger.warning(f"Cannot message new user {user.id}: {e}")
+
+
+async def send_broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user.id != ADMIN_USER_ID:
+        await update.message.reply_text("You are not authorized.")
+        return
+
+    if not update.message.reply_to_message:
+        await update.message.reply_text("Reply to a message with /send to broadcast it.")
+        return
+
+    try:
+        users_stream = db.collection('users').stream()
+        user_ids = [u.id for u in users_stream]
+    except Exception as e:
+        await update.message.reply_text(f"Error loading users: {e}")
+        return
+
+    success = 0
+    failed = 0
+    msg = await update.message.reply_text(f"Broadcasting to {len(user_ids)} users...")
+
+    for user_id_str in user_ids:
+        try:
+            user_id = int(user_id_str)
+            await context.bot.forward_message(
+                chat_id=user_id,
+                from_chat_id=update.message.reply_to_message.chat_id,
+                message_id=update.message.reply_to_message.message_id
+            )
+            success += 1
+        except Exception:
+            failed += 1
+
+    await context.bot.edit_message_text(
+        chat_id=update.message.chat_id,
+        message_id=msg.message_id,
+        text=f"Broadcast complete.\n✅ Sent: {success}\n❌ Failed: {failed}"
+    )
+
+# --- Main ---
+def main():
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("send", send_broadcast_command))
+    application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, new_member_handler))
+
+    # Run HTTP server in background (for Koyeb)
+    threading.Thread(target=start_web_server, daemon=True).start()
+
+    print("🤖 Bot is starting...")
+    application.run_polling()
+
+
+if __name__ == "__main__":
+    main()                         "To receive important updates and broadcasts, "
                          "please reply /start here in our private chat."
                 )
             except Forbidden:
