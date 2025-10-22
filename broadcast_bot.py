@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """
 Telegram Broadcast Bot (English Version)
-- Updated to fix SyntaxError on line 159.
+- Updated to fix v20+ ImportError for ParseMode.
 """
 
 import logging
 import firebase_admin
 from firebase_admin import credentials, firestore
-from telegram import Update, Bot, ParseMode, ForceReply
+from telegram import Update, Bot, ForceReply
+from telegram.constants import ParseMode  # <-- MOVED HERE
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
 
 # --- START OF CONFIGURATION ---
