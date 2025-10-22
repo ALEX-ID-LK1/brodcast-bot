@@ -1,271 +1,200 @@
-import os
-import logging
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+# -*- coding: utf-8 -*-
+"""
+Telegram Broadcast Bot (English Version)
+- Updated to fix SyntaxError on line 159.
+"""
 
+import logging
 import firebase_admin
 from firebase_admin import credentials, firestore
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from telegram.error import Forbidden, BadRequest
+from telegram import Update, Bot, ParseMode, ForceReply
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
 
-# --- Configuration ---
+# --- START OF CONFIGURATION ---
+
+# 1. Telegram Bot Token (Get from @BotFather)
 TELEGRAM_BOT_TOKEN = "8419617505:AAFwnP-m7fbhbcUYFKm85xQmz0FLsyupZbE"
+
+# 2. Admin User ID (Your Telegram User ID)
 ADMIN_USER_ID = 6687619682
+
+# 3. Target Group ID (The group ID to monitor for /start commands)
 TARGET_GROUP_ID = -1003074965096
 
-# --- Firebase Setup ---
+# --- END OF CONFIGURATION ---
+
+# Setup logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Initialize Firebase
 try:
     cred = credentials.Certificate("serviceAccountKey.json")
     firebase_admin.initialize_app(cred)
     db = firestore.client()
-    print("✅ Successfully connected to Firebase.")
+    logger.info("Firebase initialized successfully!")
 except Exception as e:
-    print(f"❌ Error connecting to Firebase: {e}")
+    logger.error(f"Failed to initialize Firebase: {e}")
+    # If Firebase fails, we can't really continue.
     exit()
 
-# --- Logging Setup ---
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+# --- BOT HANDLER FUNCTIONS ---
 
-# --- Web Server (for Koyeb) ---
-class SimpleHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Bot is running successfully on Koyeb!")
-        
-def start_web_server():
-    port = int(os.getenv("PORT", 8080))  # Koyeb sets this automatically
-    server = HTTPServer(("0.0.0.0", port), SimpleHandler)
-    print(f"🌐 Web server listening on port {port}")
-    server.serve_forever()
-
-# --- Core Functions ---
-async def save_user_to_db(user):
-    try:
-        user_ref = db.collection('users').document(str(user.id))
-        user_data = {
-            'user_id': user.id,
-            'username': user.username,
-            'first_name': user.first_name,
-            'last_active': firestore.SERVER_TIMESTAMP
-        }
-        user_ref.set(user_data, merge=True)
-        logger.info(f"User {user.id} ({user.username}) saved/updated in DB.")
-        return True
-    except Exception as e:
-        logger.error(f"Error saving user {user.id}: {e}")
-        return False
-
-
-# --- Command Handlers ---
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def start_command(update: Update, context: CallbackContext) -> None:
+    """Handles the /start command."""
     user = update.effective_user
-    if update.message.chat.type == 'private':
-        saved = await save_user_to_db(user)
-        if saved:
-            await update.message.reply_text(
-                f"Hello {user.first_name}!\n\nYou have been successfully registered for updates."
-            )
-        else:
-            await update.message.reply_text("An error occurred during registration.")
-    else:
+    chat = update.effective_chat
+    
+    logger.info(f"Received /start from user {user.id} in chat {chat.id}")
+
+    # Check if the /start command is from the TARGET_GROUP_ID
+    if str(chat.id) == str(TARGET_GROUP_ID):
         try:
-            await context.bot.send_message(
-                chat_id=user.id,
-                text=f"Hello {user.first_name}! Please send /start to me privately to register."
-            )
-        except Forbidden:
-            logger.warning(f"Cannot DM {user.id} (bot blocked).")
-        except BadRequest:
-            logger.warning(f"Cannot find chat with {user.id}.")
+            # Save user to Firestore
+            user_doc_ref = db.collection('subscribers').document(str(user.id))
+            user_doc = user_doc_ref.get()
 
-
-async def new_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.chat_id != TARGET_GROUP_ID:
-        return
-
-    for user in update.message.new_chat_members:
-        if not user.is_bot:
-            logger.info(f"New member {user.id}")
-            await save_user_to_db(user)
-            try:
-                await context.bot.send_message(
+            if not user_doc.exists:
+                user_data = {
+                    'user_id': user.id,
+                    'first_name': user.first_name,
+                    'last_name': user.last_name or '',
+                    'username': user.username or '',
+                    'subscribed_at': firestore.SERVER_TIMESTAMP
+                }
+                user_doc_ref.set(user_data)
+                logger.info(f"New user {user.id} added to Firestore.")
+                
+                # Send a private confirmation message
+                context.bot.send_message(
                     chat_id=user.id,
-                    text=f"Welcome {user.first_name}! Send /start here to subscribe for updates."
+                    text="✅ *Subscribed Successfully!*\n\n"
+                         "You have been successfully subscribed to our broadcast list. "
+                         "You will now receive important updates directly to your inbox.",
+                    parse_mode=ParseMode.MARKDOWN
                 )
-            except Exception as e:
-                logger.warning(f"Cannot message new user {user.id}: {e}")
-
-
-async def send_broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if user.id != ADMIN_USER_ID:
-        await update.message.reply_text("You are not authorized.")
-        return
-
-    if not update.message.reply_to_message:
-        await update.message.reply_text("Reply to a message with /send to broadcast it.")
-        return
-
-    try:
-        users_stream = db.collection('users').stream()
-        user_ids = [u.id for u in users_stream]
-    except Exception as e:
-        await update.message.reply_text(f"Error loading users: {e}")
-        return
-
-    success = 0
-    failed = 0
-    msg = await update.message.reply_text(f"Broadcasting to {len(user_ids)} users...")
-
-    for user_id_str in user_ids:
-        try:
-            user_id = int(user_id_str)
-            await context.bot.forward_message(
-                chat_id=user_id,
-                from_chat_id=update.message.reply_to_message.chat_id,
-                message_id=update.message.reply_to_message.message_id
-            )
-            success += 1
-        except Exception:
-            failed += 1
-
-    await context.bot.edit_message_text(
-        chat_id=update.message.chat_id,
-        message_id=msg.message_id,
-        text=f"Broadcast complete.\n✅ Sent: {success}\n❌ Failed: {failed}"
-    )
-
-# --- Main ---
-def main():
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("send", send_broadcast_command))
-    application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, new_member_handler))
-
-    # Run HTTP server in background (for Koyeb)
-    threading.Thread(target=start_web_server, daemon=True).start()
-
-    print("🤖 Bot is starting...")
-    application.run_polling()
-
-
-if __name__ == "__main__":
-    main()                         "To receive important updates and broadcasts, "
-                         "please reply /start here in our private chat."
+            else:
+                logger.info(f"User {user.id} is already subscribed.")
+                # Optionally, send a "you are already subscribed" message
+                context.bot.send_message(
+                    chat_id=user.id,
+                    text="ℹ️ You are already on the broadcast list."
                 )
-            except Forbidden:
-                logger.warning(f"Cannot send DM to new user {user.id} (Bot is blocked).")
-            except BadRequest:
-                logger.warning(f"Cannot find chat with new user {user.id} (User hasn't started the bot).")
 
-
-async def send_broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Handles the /send command (Admin only) to broadcast a replied-to message.
-    """
-    user = update.effective_user
-
-    # 1. Check if the user is the Admin
-    if user.id != ADMIN_USER_ID:
-        await update.message.reply_text("You are not authorized to use this command.")
-        return
-
-    # 2. Check if the command is a reply to another message
-    if not update.message.reply_to_message:
-        await update.message.reply_text("Please use this command as a reply to the message you want to broadcast.")
-        return
-
-    message_to_forward = update.message.reply_to_message
-    
-    # 3. Get all user IDs from Firebase
-    try:
-        users_stream = db.collection('users').stream()
-        user_ids = [user.id for user in users_stream]
-    except Exception as e:
-        logger.error(f"Error fetching user IDs from Firebase: {e}")
-        await update.message.reply_text(f"Error fetching users from database: {e}")
-        return
-
-    if not user_ids:
-        await update.message.reply_text("There are no users registered to broadcast to.")
-        return
-
-    # 4. Start broadcasting
-    success_count = 0
-    failure_count = 0
-    
-    status_message = await update.message.reply_text(f"Starting broadcast to {len(user_ids)} users...")
-
-    for user_id_str in user_ids:
-        user_id = int(user_id_str)
-        try:
-            await context.bot.forward_message(
-                chat_id=user_id,
-                from_chat_id=message_to_forward.chat_id,
-                message_id=message_to_forward.message_id
-            )
-            success_count += 1
-        except Forbidden:
-            logger.warning(f"Failed to send to {user_id} (Bot blocked).")
-            failure_count += 1
-            # Optional: You could remove this user from the DB
-            # db.collection('users').document(str(user_id)).delete()
-        except BadRequest as e:
-            logger.warning(f"Failed to send to {user_id}: {e}")
-            failure_count += 1
         except Exception as e:
-            logger.error(f"Unknown error sending to {user_id}: {e}")
-            failure_count += 1
+            logger.error(f"Error handling /start command for user {user.id}: {e}")
+            # Try to inform the user privately that an error occurred
+            try:
+                context.bot.send_message(
+                    chat_id=user.id,
+                    text="⚠️ An error occurred while subscribing. Please try again later."
+                )
+            except Exception as e_inner:
+                logger.error(f"Failed to send error DM to user {user.id}: {e_inner}")
 
-    # 5. Send the final report to the Admin
-    await context.bot.edit_message_text(
-        text=f"Broadcast Complete!\n\n"
-             f"Successfully sent: {success_count}\n"
-             f"Failed to send: {failure_count}",
-        chat_id=update.message.chat_id,
-        message_id=status_message.message_id
-    )
-    logger.info(f"Broadcast finished. Success: {success_count}, Failed: {failure_count}")
+    else:
+        # If /start is in a private chat or another group
+        logger.info(f"Ignoring /start from user {user.id} in non-target chat {chat.id}")
+        if chat.type == 'private':
+            update.message.reply_text(
+                f"👋 Hello! To subscribe, please go to our main group and type /start.\n\n"
+                f"(You must be a member of the group with ID: `{TARGET_GROUP_ID}`)",
+                parse_mode=ParseMode.MARKDOWN
+            )
 
+def broadcast_handler(update: Update, context: CallbackContext) -> None:
+    """Handles the /send command to broadcast a message."""
+    user = update.effective_user
 
-def main():
-    """Starts the bot."""
-    
-    # Check if config values were entered (although they are pre-filled now)
-    if TELEGRAM_BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN_HERE":
-        print("Error: TELEGRAM_BOT_TOKEN is not set.")
-        print("Please edit broadcast_bot.py and add your bot token.")
+    # Only allow the ADMIN_USER_ID to use this command
+    if user.id != ADMIN_USER_ID:
+        logger.warning(f"Unauthorized /send attempt by user {user.id}")
+        update.message.reply_text("⛔ Sorry, you are not authorized to use this command.")
         return
 
-    # Create the Application
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    # Check if the /send command is replying to a message
+    if not update.message.reply_to_message:
+        logger.info(f"Admin {user.id} used /send without replying to a message.")
+        update.message.reply_text(
+            "⚠️ *How to use:*\n"
+            "1. Send the message you want to broadcast (text, photo, video, etc.).\n"
+            "2. **Reply** to that message and type `/send`.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
 
-    # --- Add Handlers ---
+    # Get the message to be broadcasted
+    message_to_broadcast = update.message.reply_to_message
     
-    # /start command in Private Chats (DMs)
-    application.add_handler(CommandHandler("start", start_command, filters=filters.ChatType.PRIVATE))
-    
-    # /start command in Group Chats
-    application.add_handler(CommandHandler("start", start_command, filters=filters.ChatType.GROUPS))
+    # Get all subscribers from Firestore
+    try:
+        users_ref = db.collection('subscribers').stream()
+        subscriber_ids = [user.id for user in users_ref]
+        
+        if not subscriber_ids:
+            update.message.reply_text("Database is empty. No subscribers found to broadcast to.")
+            return
 
-    # /send command (for the Admin)
-    application.add_handler(CommandHandler("send", send_broadcast_command))
+        update.message.reply_text(
+            f"🚀 *Broadcast started...*\n\n"
+            f"Forwarding message to *{len(subscriber_ids)}* subscriber(s).",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        
+        success_count = 0
+        failure_count = 0
 
-    # New members joining
-    # (The bot needs admin rights in the group for this to work)
-    application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, new_member_handler))
+        # Loop through each subscriber and forward the message
+        for user_id_str in subscriber_ids:
+            try:
+                user_id_int = int(user_id_str)
+                context.bot.forward_message(
+                    chat_id=user_id_int,
+                    from_chat_id=message_to_broadcast.chat_id,
+                    message_id=message_to_broadcast.message_id
+                )
+                success_count += 1
+            except Exception as e:
+                failure_count += 1
+                logger.error(f"Failed to forward message to {user_id_str}: {e}")
+                # If a user blocked the bot, we can remove them
+                if "bot was blocked by the user" in str(e).lower():
+                    logger.info(f"User {user_id_str} blocked the bot. Removing from database.")
+                    db.collection('subscribers').document(user_id_str).delete()
 
-    # Run the bot
-    print("Bot is starting...")
-    application.run_polling()
+        # Send a summary report to the admin
+        context.bot.send_message(
+            chat_id=ADMIN_USER_ID,
+            text=f"✅ *Broadcast Complete!*\n\n"
+                 f"Sent to: *{success_count}* users\n"
+                 f"Failed for: *{failure_count}* users",
+            parse_mode=ParseMode.MARKDOWN
+        )
 
+    except Exception as e:
+        logger.error(f"Failed to fetch subscribers from Firestore: {e}")
+        update.message.reply_text(f"An error occurred while fetching subscribers: {e}")
 
-if __name__ == "__main__":
+def main() -> None:
+    """Start the bot."""
+    if not TELEGRAM_BOT_TOKEN:
+        logger.error("TELEGRAM_BOT_TOKEN is not set! Please check your configuration.")
+        return
+
+    updater = Updater(TELEGRAM_BOT_TOKEN)
+    dispatcher = updater.dispatcher
+
+    # Add handlers
+    dispatcher.add_handler(CommandHandler("start", start_command))
+    dispatcher.add_handler(CommandHandler("send", broadcast_handler, filters=Filters.user(user_id=ADMIN_USER_ID)))
+
+    # Start the Bot
+    updater.start_polling()
+    logger.info("Bot started successfully and is polling for updates...")
+    updater.idle()
+
+if __name__ == '__main__':
     main()
 
