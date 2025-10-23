@@ -4,10 +4,11 @@ ADVANCED Telegram Broadcast Bot (Sinhala Welcome / English Admin)
 - All code in a single file.
 - Scheduling features are REMOVED.
 
---- FIX v4.0 (මෙම අනුවාදයේ වෙනස) ---
--   CRITICAL FIX: Added a master try...except block around the entire 'do_broadcast' function.
--   If the broadcast fails for any reason, it will now send a detailed error message to the Admin
-    instead of failing silently. (විකාශනය අසාර්ථක වුවහොත්, Admin ට error message එකක් යවයි).
+--- FIX v5.0 (මෙම අනුවාදයේ වෙනස) ---
+-   CRITICAL FIX: Fixed "InlineKeyboardMarkup has no attribute 'from_dict'" error.
+-   The bot now passes the 'InlineKeyboardMarkup' object directly between confirmation and
+    broadcasting, instead of converting it to/from a dict.
+    (බොත්තම් ටික dict එකක් බවට පත්කිරීමේ දෝෂය නිරාකරණය කර ඇත).
 
 --- FEATURES (විශේෂාංග) ---
 1.  Group Welcome: Welcomes new users in SINHALA.
@@ -86,7 +87,7 @@ async def notify_admin_on_startup(app: Application) -> None:
     try:
         await app.bot.send_message(
             chat_id=ADMIN_USER_ID,
-            text=f"🤖 *Bot is now ONLINE! (v4.0 Error Fix)*\n\n"
+            text=f"🤖 *Bot is now ONLINE! (v5.0 Button Fix)*\n\n"
                  f"Throttling: *{BROADCAST_RATE_LIMIT} msg/sec*\n"
                  f"Features: Group Welcome, Button Confirmations.\n"
                  f"Use /vip to see your admin commands.",
@@ -138,14 +139,20 @@ async def do_broadcast(context: ContextTypes.DEFAULT_TYPE, job_data: dict) -> No
     The main broadcast function (with throttling).
     Wrapped in a try/except to report errors.
     """
-    admin_id = job_data.get("admin_id", ADMIN_USER_ID) # Admin ID එක ලබාගැනීම
+    admin_id = job_data.get("admin_id", ADMIN_USER_ID)
 
     try:
         # --- Broadcast එක සකස් කිරීම ---
         from_chat_id = job_data["from_chat_id"]
         message_id = job_data["message_id"]
-        buttons_dict = job_data.get("buttons")
-        buttons_markup = InlineKeyboardMarkup.from_dict(buttons_dict) if buttons_dict else None
+        
+        # --- FIX v5.0 ---
+        # බොත්තම් 'dict' එකක් ලෙස නොව, 'object' එකක් ලෙසම ලබාගැනීම
+        # buttons_dict = job_data.get("buttons") # <-- පරණ ක්‍රමය (වැරදියි)
+        # buttons_markup = InlineKeyboardMarkup.from_dict(buttons_dict) if buttons_dict else None # <-- පරණ ක්‍රමය (වැරදියි)
+        
+        buttons_markup = job_data.get("buttons") # <-- අලුත් ක්‍රමය (නිවැරදියි)
+        
         operation = "copy" if buttons_markup else "forward"
         
         subscriber_ids = get_subscriber_ids()
@@ -158,7 +165,6 @@ async def do_broadcast(context: ContextTypes.DEFAULT_TYPE, job_data: dict) -> No
         failure_count = 0
         
         # --- Admin ට "Broadcast Started" පණිවිඩය යැවීම ---
-        # (මෙය යැවීමට පෙර error එකක් ආවොත්, පහත 'except' block එකෙන් Admin ට දන්වයි)
         await context.bot.send_message(
             admin_id,
             f"🚀 *Broadcast Started...*\n\n"
@@ -191,7 +197,6 @@ async def do_broadcast(context: ContextTypes.DEFAULT_TYPE, job_data: dict) -> No
                 failure_count += 1
                 logger.error(f"Unknown error sending to {user_id_str}: {e}")
             
-            # Throttling - වේගය පාලනය කිරීම
             await asyncio.sleep(1 / BROADCAST_RATE_LIMIT)
 
         # --- අවසන් වාර්තාව Admin ට යැවීම ---
@@ -205,13 +210,8 @@ async def do_broadcast(context: ContextTypes.DEFAULT_TYPE, job_data: dict) -> No
         )
     
     except Exception as e:
-        # --- THIS IS THE CRITICAL FIX ---
-        # ඉහත 'try' block එකේ (උදා: subscriber_ids = get_subscriber_ids())
-        # කොතැනක හෝ දෝෂයක් සිදු වුවහොත්, මෙම 'except' block එක ක්‍රියාත්මක වේ.
         logger.error(f"CRITICAL ERROR in do_broadcast: {e}", exc_info=True)
         try:
-            # Admin ට දෝෂය පිළිබඳව දැනුම් දීම
-            error_details = traceback.format_exc() # දෝෂයේ සම්පූර්ණ විස්තරය
             await context.bot.send_message(
                 admin_id,
                 f"🆘 *Broadcast FAILED!*\n\n"
@@ -240,7 +240,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not membership["is_member"]:
         logger.info(f"User {user.id} is not in the group (Status: {membership['status']}). Subscription rejected.")
         reply_text = (
-            "⛔ *ලියාපදිංචිය අසාර්ථකයි*\n\n"
+            "⛔ *ලියාදිංචිය අසාර්ථකයි*\n\n"
             "Broadcast සේවාව ලබාගැනීමට, ඔබ අපගේ ප්‍රධාන group එකේ සාමාජිකයෙකු විය යුතුය.\n\n"
             "කරුණාකර group එකට join වී, නැවත මෙහි /start ලෙස ටයිප් කරන්න."
         )
@@ -352,7 +352,7 @@ async def new_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def vip_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Displays the Admin VIP Menu (English)."""
     menu_text = (
-        "👑 *Admin VIP Menu (v4.0 Error Fix)*\n\n"
+        "👑 *Admin VIP Menu (v5.0 Button Fix)*\n\n"
         
         "*/vip*\n"
         "› Shows this help menu.\n\n"
@@ -376,6 +376,7 @@ async def vip_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     )
     await update.message.reply_text(menu_text, parse_mode=ParseMode.MARKDOWN)
 
+# --- CRITICAL FIX in this function ---
 async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handles the /send command (English logic)."""
     
@@ -389,11 +390,15 @@ async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     subscriber_count = len(get_subscriber_ids())
     operation = "COPY with buttons" if buttons else "FORWARD"
 
+    # දත්ත තාවකාලිකව මතකයේ තබාගැනීම
     context.chat_data['pending_broadcast'] = {
         "admin_id": update.effective_user.id,
         "from_chat_id": message_to_send.chat_id,
         "message_id": message_to_send.message_id,
-        "buttons": buttons.to_dict() if buttons else None,
+        # --- FIX v5.0 ---
+        # 'dict' එකක් වෙනුවට 'object' එකම තබාගැනීම
+        # "buttons": buttons.to_dict() if buttons else None, # <-- පරණ ක්‍රමය (වැරදියි)
+        "buttons": buttons, # <-- අලුත් ක්‍රමය (නිවැරදියි)
         "count": subscriber_count,
         "operation": operation
     }
@@ -426,10 +431,8 @@ async def button_confirmation_handler(update: Update, context: ContextTypes.DEFA
             await query.edit_message_text("⚠️ This action has expired or was already confirmed.", reply_markup=None)
             return
         
-        # Admin ට "Confirmed" පණිවිඩය යැවීම
         await query.edit_message_text("✅ Confirmed. Starting broadcast...\n\n(You will get a 'Started' message next, followed by a 'Complete' report.)", reply_markup=None)
         
-        # broadcast එක background task එකක් ලෙස පටන් ගැනීම
         context.application.create_task(do_broadcast(context, job_data))
         
     elif data == "confirm_broadcast_no":
@@ -519,7 +522,7 @@ def main() -> None:
     
     application.add_handler(CallbackQueryHandler(button_confirmation_handler, pattern="^confirm_"))
 
-    logger.info("Bot (v4.0 Error Fix Edition) started successfully... polling...")
+    logger.info("Bot (v5.0 Button Fix Edition) started successfully... polling...")
     application.run_polling()
 
 if __name__ == '__main__':
