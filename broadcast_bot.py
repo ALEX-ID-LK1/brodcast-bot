@@ -4,20 +4,26 @@ ADVANCED Telegram Broadcast Bot (Sinhala Welcome / English Admin)
 - All code in a single file.
 - Scheduling features are REMOVED.
 
+--- FIX v4.0 (මෙම අනුවාදයේ වෙනස) ---
+-   CRITICAL FIX: Added a master try...except block around the entire 'do_broadcast' function.
+-   If the broadcast fails for any reason, it will now send a detailed error message to the Admin
+    instead of failing silently. (විකාශනය අසාර්ථක වුවහොත්, Admin ට error message එකක් යවයි).
+
 --- FEATURES (විශේෂාංග) ---
-1.  Group Welcome: Welcomes new users (joined or added) in the group in SINHALA.
-2.  Group /start: Checks if user is in DB. If not, replies in SINHALA with a "Start" button.
-3.  Language Mix: Admin panel is in English, User-facing messages are in Sinhala.
-4.  Multi-Line Buttons (බහු-පේළි බොත්තම්)
+1.  Group Welcome: Welcomes new users in SINHALA.
+2.  Group /start: Checks DB, replies in SINHALA.
+3.  Language Mix: Admin panel in English, User messages in Sinhala.
+4.  Multi-Line Buttons
 5.  Smart Send (Auto Forward/Copy)
-6.  Button Confirmation (YES/NO බොත්තම් මගින් තහවුරු කිරීම)
-7.  Broadcast Throttling (විකාශන වේගය පාලනය)
+6.  Button Confirmation (YES/NO)
+7.  Broadcast Throttling
 """
 
 import logging
 import firebase_admin
 import asyncio
 import re
+import traceback # Error එකේ විස්තර ලබාගැනීමට
 from firebase_admin import credentials, firestore
 from datetime import datetime
 from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup, User
@@ -29,7 +35,7 @@ from telegram.ext import (
     MessageHandler,
     ContextTypes,
     filters,
-    CallbackQueryHandler # බොත්තම් click කිරීම් සඳහා මෙය අනිවාර්යයි
+    CallbackQueryHandler
 )
 
 # --- START OF CONFIGURATION (සැකසුම්) ---
@@ -80,7 +86,7 @@ async def notify_admin_on_startup(app: Application) -> None:
     try:
         await app.bot.send_message(
             chat_id=ADMIN_USER_ID,
-            text=f"🤖 *Bot is now ONLINE! (Sinhala Welcome / Button Confirm Edition)*\n\n"
+            text=f"🤖 *Bot is now ONLINE! (v4.0 Error Fix)*\n\n"
                  f"Throttling: *{BROADCAST_RATE_LIMIT} msg/sec*\n"
                  f"Features: Group Welcome, Button Confirmations.\n"
                  f"Use /vip to see your admin commands.",
@@ -126,62 +132,97 @@ def get_subscriber_ids() -> list:
         logger.error(f"Could not get subscriber IDs from Firestore: {e}")
         return []
 
+# --- CRITICAL FIX in this function ---
 async def do_broadcast(context: ContextTypes.DEFAULT_TYPE, job_data: dict) -> None:
-    """The main broadcast function (English logic)."""
-    admin_id = job_data["admin_id"]
-    from_chat_id = job_data["from_chat_id"]
-    message_id = job_data["message_id"]
-    buttons_dict = job_data.get("buttons")
-    buttons_markup = InlineKeyboardMarkup.from_dict(buttons_dict) if buttons_dict else None
-    operation = "copy" if buttons_markup else "forward"
-    
-    subscriber_ids = get_subscriber_ids()
-    if not subscriber_ids:
-        await context.bot.send_message(admin_id, "Broadcast cancelled. The subscriber database is empty.")
-        return
+    """
+    The main broadcast function (with throttling).
+    Wrapped in a try/except to report errors.
+    """
+    admin_id = job_data.get("admin_id", ADMIN_USER_ID) # Admin ID එක ලබාගැනීම
 
-    total_users = len(subscriber_ids)
-    success_count = 0
-    failure_count = 0
+    try:
+        # --- Broadcast එක සකස් කිරීම ---
+        from_chat_id = job_data["from_chat_id"]
+        message_id = job_data["message_id"]
+        buttons_dict = job_data.get("buttons")
+        buttons_markup = InlineKeyboardMarkup.from_dict(buttons_dict) if buttons_dict else None
+        operation = "copy" if buttons_markup else "forward"
+        
+        subscriber_ids = get_subscriber_ids()
+        if not subscriber_ids:
+            await context.bot.send_message(admin_id, "Broadcast cancelled. The subscriber database is empty.")
+            return
+
+        total_users = len(subscriber_ids)
+        success_count = 0
+        failure_count = 0
+        
+        # --- Admin ට "Broadcast Started" පණිවිඩය යැවීම ---
+        # (මෙය යැවීමට පෙර error එකක් ආවොත්, පහත 'except' block එකෙන් Admin ට දන්වයි)
+        await context.bot.send_message(
+            admin_id,
+            f"🚀 *Broadcast Started...*\n\n"
+            f"Operation: *{operation.upper()}*\n"
+            f"Sending to *{total_users}* users (Rate: {BROADCAST_RATE_LIMIT} msg/sec).\n\n"
+            f"You will get a final report when this is complete.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        
+        # --- Throttled Loop (පණිවිඩ යැවීමේ loop එක) ---
+        for user_id_str in subscriber_ids:
+            try:
+                user_id_int = int(user_id_str)
+                if operation == "copy":
+                    await context.bot.copy_message(chat_id=user_id_int, from_chat_id=from_chat_id, message_id=message_id, reply_markup=buttons_markup)
+                else:
+                    await context.bot.forward_message(chat_id=user_id_int, from_chat_id=from_chat_id, message_id=message_id)
+                success_count += 1
+            except (Forbidden, BadRequest) as e:
+                failure_count += 1
+                if "bot was blocked by the user" in str(e).lower() or "user is deactivated" in str(e).lower():
+                    logger.info(f"User {user_id_str} blocked the bot. Removing from database...")
+                    try:
+                        db.collection('subscribers').document(user_id_str).delete()
+                    except Exception as del_e:
+                        logger.error(f"Failed to delete user {user_id_str}: {del_e}")
+                else:
+                    logger.error(f"Failed to send to {user_id_str}: {e}")
+            except Exception as e:
+                failure_count += 1
+                logger.error(f"Unknown error sending to {user_id_str}: {e}")
+            
+            # Throttling - වේගය පාලනය කිරීම
+            await asyncio.sleep(1 / BROADCAST_RATE_LIMIT)
+
+        # --- අවසන් වාර්තාව Admin ට යැවීම ---
+        await context.bot.send_message(
+            admin_id,
+            f"✅ *Broadcast Complete!*\n\n"
+            f"Successfully Sent: *{success_count}*\n"
+            f"Failed to Send: *{failure_count}*\n"
+            f"(Blocked/Deactivated users have been auto-removed)",
+            parse_mode=ParseMode.MARKDOWN
+        )
     
-    await context.bot.send_message(
-        admin_id,
-        f"🚀 *Broadcast Started...*\n\n"
-        f"Operation: *{operation.upper()}*\n"
-        f"Sending to *{total_users}* users (Rate: {BROADCAST_RATE_LIMIT} msg/sec).\n\n"
-        f"You will get a final report when this is complete.",
-        parse_mode=ParseMode.MARKDOWN
-    )
-    
-    for user_id_str in subscriber_ids:
+    except Exception as e:
+        # --- THIS IS THE CRITICAL FIX ---
+        # ඉහත 'try' block එකේ (උදා: subscriber_ids = get_subscriber_ids())
+        # කොතැනක හෝ දෝෂයක් සිදු වුවහොත්, මෙම 'except' block එක ක්‍රියාත්මක වේ.
+        logger.error(f"CRITICAL ERROR in do_broadcast: {e}", exc_info=True)
         try:
-            user_id_int = int(user_id_str)
-            if operation == "copy":
-                await context.bot.copy_message(chat_id=user_id_int, from_chat_id=from_chat_id, message_id=message_id, reply_markup=buttons_markup)
-            else:
-                await context.bot.forward_message(chat_id=user_id_int, from_chat_id=from_chat_id, message_id=message_id)
-            success_count += 1
-        except (Forbidden, BadRequest) as e:
-            failure_count += 1
-            if "bot was blocked by the user" in str(e).lower() or "user is deactivated" in str(e).lower():
-                logger.info(f"User {user_id_str} blocked the bot. Removing from database...")
-                try:
-                    db.collection('subscribers').document(user_id_str).delete()
-                except Exception as del_e:
-                    logger.error(f"Failed to delete user {user_id_str}: {del_e}")
-        except Exception as e:
-            failure_count += 1
-            logger.error(f"Unknown error sending to {user_id_str}: {e}")
-        await asyncio.sleep(1 / BROADCAST_RATE_LIMIT)
+            # Admin ට දෝෂය පිළිබඳව දැනුම් දීම
+            error_details = traceback.format_exc() # දෝෂයේ සම්පූර්ණ විස්තරය
+            await context.bot.send_message(
+                admin_id,
+                f"🆘 *Broadcast FAILED!*\n\n"
+                f"An unexpected error occurred and the broadcast could not be started.\n\n"
+                f"*Error Message:* `{e}`\n\n"
+                f"*(For dev: Check server logs for full traceback)*",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        except Exception as report_e:
+            logger.error(f"Failed to even report the broadcast error to admin: {report_e}")
 
-    await context.bot.send_message(
-        admin_id,
-        f"✅ *Broadcast Complete!*\n\n"
-        f"Successfully Sent: *{success_count}*\n"
-        f"Failed to Send: *{failure_count}*\n"
-        f"(Blocked/Deactivated users have been auto-removed)",
-        parse_mode=ParseMode.MARKDOWN
-    )
 
 # --- BOT HANDLER FUNCTIONS (Public - SINHALA REPLIES) ---
 
@@ -311,7 +352,7 @@ async def new_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def vip_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Displays the Admin VIP Menu (English)."""
     menu_text = (
-        "👑 *Admin VIP Menu (English Version)*\n\n"
+        "👑 *Admin VIP Menu (v4.0 Error Fix)*\n\n"
         
         "*/vip*\n"
         "› Shows this help menu.\n\n"
@@ -357,7 +398,6 @@ async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "operation": operation
     }
 
-    # ----- මෙන්න ඔබ ඉල්ලූ 'YES'/'NO' බොත්තම් -----
     keyboard = [
         [InlineKeyboardButton("✅ YES (Confirm)", callback_data="confirm_broadcast_yes")],
         [InlineKeyboardButton("❌ NO (Cancel)", callback_data="confirm_broadcast_no")]
@@ -368,9 +408,9 @@ async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"⚠️ *Confirm Broadcast*\n\n"
         f"You are about to *{operation.upper()}* this message.\n"
         f"Total Subscribers: *{subscriber_count}*\n\n"
-        f"Please confirm or cancel using the buttons below:", # "බොත්තම් මගින් තහවුරු කරන්න"
+        f"Please confirm or cancel using the buttons below:",
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=reply_markup # බොත්තම් මෙතනින් යවනවා
+        reply_markup=reply_markup
     )
 
 async def button_confirmation_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -385,7 +425,11 @@ async def button_confirmation_handler(update: Update, context: ContextTypes.DEFA
         if job_data is None:
             await query.edit_message_text("⚠️ This action has expired or was already confirmed.", reply_markup=None)
             return
-        await query.edit_message_text("✅ Confirmed. Starting broadcast...", reply_markup=None)
+        
+        # Admin ට "Confirmed" පණිවිඩය යැවීම
+        await query.edit_message_text("✅ Confirmed. Starting broadcast...\n\n(You will get a 'Started' message next, followed by a 'Complete' report.)", reply_markup=None)
+        
+        # broadcast එක background task එකක් ලෙස පටන් ගැනීම
         context.application.create_task(do_broadcast(context, job_data))
         
     elif data == "confirm_broadcast_no":
@@ -463,24 +507,19 @@ def main() -> None:
     group_filter = filters.Chat(chat_id=TARGET_GROUP_ID)
 
     # --- Handlers ---
-    # Public DM command (Sinhala replies)
     application.add_handler(CommandHandler("start", start_command, filters=filters.ChatType.PRIVATE))
-    
-    # NEW: Public Group Commands (Sinhala replies)
     application.add_handler(CommandHandler("start", group_start_handler, filters=group_filter & filters.ChatType.GROUPS))
     application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS & group_filter, new_member_handler))
 
-    # Admin commands (English replies)
     application.add_handler(CommandHandler("vip", vip_menu_handler, filters=admin_filter))
     application.add_handler(CommandHandler("send", send_command, filters=admin_filter))
     application.add_handler(CommandHandler("stats", stats_handler, filters=admin_filter))
     application.add_handler(CommandHandler("deluser", delete_user_handler, filters=admin_filter))
     application.add_handler(CommandHandler("getuser", get_user_handler, filters=admin_filter))
     
-    # --- බොත්තම් සඳහා Handler (මෙය අනිවාර්යයි) ---
     application.add_handler(CallbackQueryHandler(button_confirmation_handler, pattern="^confirm_"))
 
-    logger.info("Bot (Sinhala Welcome / Button Confirm Edition) started successfully... polling...")
+    logger.info("Bot (v4.0 Error Fix Edition) started successfully... polling...")
     application.run_polling()
 
 if __name__ == '__main__':
