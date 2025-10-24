@@ -42,7 +42,7 @@ from telegram.ext import (
 # --- START OF CONFIGURATION (සැකසුම්) ---
 TELEGRAM_BOT_TOKEN = "8419617505:AAFwnP-m7fbhbcUYFKm85xQmz0FLsyupZbE"
 ADMIN_USER_ID = 6687619682
-TARGET_GROUP_ID = -1003074965096
+TARGET_GROUP_ID = -1003084456496
 BOT_USERNAME = "Paid_updates_bot" # (ඔබගේ bot ගේ username එක @ ලකුණ නොමැතිව)
 # --- END OF CONFIGURATION ---
 
